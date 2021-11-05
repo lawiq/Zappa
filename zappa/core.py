@@ -249,9 +249,7 @@ ALB_LAMBDA_ALIAS = "current-alb-version"
 class Zappa:
     """
     Zappa!
-
     Makes it easy to run Python web applications on AWS Lambda/API Gateway.
-
     """
 
     ##
@@ -311,15 +309,17 @@ class Zappa:
             self.manylinux_suffix_start = "cp36m"
         elif self.runtime == "python3.7":
             self.manylinux_suffix_start = "cp37m"
-        else:
+        elif self.runtime == "python3.8":
             # The 'm' has been dropped in python 3.8+ since builds with and without pymalloc are ABI compatible
             # See https://github.com/pypa/manylinux for a more detailed explanation
             self.manylinux_suffix_start = "cp38"
+        else:
+            self.manylinux_suffix_start = "cp39"
 
         # AWS Lambda supports manylinux1/2010 and manylinux2014
         manylinux_suffixes = ("2014", "2010", "1")
         self.manylinux_wheel_file_match = re.compile(
-            f'^.*{self.manylinux_suffix_start}-manylinux({"|".join(manylinux_suffixes)})_x86_64.whl$'
+            f'^.*{self.manylinux_suffix_start}-(manylinux_\d+_\d+_x86_64[.])?manylinux({"|".join(manylinux_suffixes)})_x86_64[.]whl$'
         )
         self.manylinux_wheel_abi3_file_match = re.compile(
             f'^.*cp3.-abi3-manylinux({"|".join(manylinux_suffixes)})_x86_64.whl$'
@@ -561,9 +561,7 @@ class Zappa:
     ):
         """
         Create a Lambda-ready zip file of the current virtualenvironment and working directory.
-
         Returns path to that file.
-
         """
         # Validate archive_format
         if archive_format not in ["zip", "tarball"]:
@@ -995,10 +993,8 @@ class Zappa:
         """
         For a given package name, returns a link to the download URL,
         else returns None.
-
         Related: https://github.com/Miserlou/Zappa/issues/398
         Examples here: https://gist.github.com/perrygeo/9545f94eaddec18a65fd7b56880adbae
-
         This function downloads metadata JSON of `package_name` from Pypi
         and examines if the package has a manylinux wheel. This function
         also caches the JSON file so that we don't have to poll Pypi
@@ -1048,9 +1044,7 @@ class Zappa:
         r"""
         Given a file, upload it to S3.
         Credentials should be stored in environment variables or ~/.aws/credentials (%USERPROFILE%\.aws\credentials on Windows).
-
         Returns True on success, false on failure.
-
         """
         try:
             self.s3_client.head_bucket(Bucket=bucket_name)
@@ -1136,11 +1130,8 @@ class Zappa:
     def remove_from_s3(self, file_name, bucket_name):
         """
         Given a file name and a bucket, remove it from S3.
-
         There's no reason to keep the file hosted on S3 once its been made into a Lambda function, so we can delete it from S3.
-
         Returns True on success, False on failure.
-
         """
         try:
             self.s3_client.head_bucket(Bucket=bucket_name)
@@ -1184,6 +1175,7 @@ class Zappa:
         use_alb=False,
         layers=None,
         concurrency=None,
+        docker_image_uri=None,
     ):
         """
         Given a bucket and key (or a local path) of a valid Lambda-zip, a function name and a handler, register that Lambda function.
@@ -1203,9 +1195,7 @@ class Zappa:
 
         kwargs = dict(
             FunctionName=function_name,
-            Runtime=runtime,
             Role=self.credentials_arn,
-            Handler=handler,
             Description=description,
             Timeout=timeout,
             MemorySize=memory_size,
@@ -1217,11 +1207,23 @@ class Zappa:
             TracingConfig={"Mode": "Active" if self.xray_tracing else "PassThrough"},
             Layers=layers,
         )
-        if local_zip:
+        if not docker_image_uri:
+            kwargs["Runtime"] = runtime
+            kwargs["Handler"] = handler
+            kwargs["PackageType"] = "Zip"
+
+        if docker_image_uri:
+            kwargs["Code"] = {"ImageUri": docker_image_uri}
+            # default is ZIP. override to Image for container support
+            kwargs["PackageType"] = "Image"
+            # The create function operation times out when this is '' (the default)
+            # So just remove it from the kwargs if it is not specified
+            if aws_kms_key_arn == "":
+                kwargs.pop("KMSKeyArn")
+        elif local_zip:
             kwargs["Code"] = {"ZipFile": local_zip}
         else:
             kwargs["Code"] = {"S3Bucket": bucket, "S3Key": s3_key}
-
         response = self.lambda_client.create_function(**kwargs)
         resource_arn = response["FunctionArn"]
         version = response["Version"]
@@ -1247,6 +1249,9 @@ class Zappa:
                 ReservedConcurrentExecutions=concurrency,
             )
 
+        # Wait for lambda to become active, otherwise many operations will fail
+        self.wait_until_lambda_function_is_active(function_name)
+
         return resource_arn
 
     def update_lambda_function(
@@ -1258,6 +1263,7 @@ class Zappa:
         local_zip=None,
         num_revisions=None,
         concurrency=None,
+        docker_image_uri=None,
     ):
         """
         Given a bucket and key (or a local path) of a valid Lambda-zip, a function name and a handler, update that Lambda function's code.
@@ -1266,7 +1272,9 @@ class Zappa:
         print("Updating Lambda function code..")
 
         kwargs = dict(FunctionName=function_name, Publish=publish)
-        if local_zip:
+        if docker_image_uri:
+            kwargs["ImageUri"] = docker_image_uri
+        elif local_zip:
             kwargs["ZipFile"] = local_zip
         else:
             kwargs["S3Bucket"] = bucket
@@ -1330,6 +1338,8 @@ class Zappa:
                     FunctionName=function_name, Qualifier=version
                 )
 
+        self.wait_until_lambda_function_is_updated(function_name)
+
         return resource_arn
 
     def update_lambda_configuration(
@@ -1346,6 +1356,7 @@ class Zappa:
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         layers=None,
+        wait=True,
     ):
         """
         Given an existing function ARN, update the configuration variables.
@@ -1363,6 +1374,10 @@ class Zappa:
         if not layers:
             layers = []
 
+        if wait:
+            # Wait until function is ready, otherwise expected keys will be missing from 'lambda_aws_config'.
+            self.wait_until_lambda_function_is_updated(function_name)
+
         # Check if there are any remote aws lambda env vars so they don't get trashed.
         # https://github.com/Miserlou/Zappa/issues/987,  Related: https://github.com/Miserlou/Zappa/issues/765
         lambda_aws_config = self.lambda_client.get_function_configuration(
@@ -1377,20 +1392,28 @@ class Zappa:
                 if key not in aws_environment_variables:
                     aws_environment_variables[key] = value
 
-        response = self.lambda_client.update_function_configuration(
-            FunctionName=function_name,
-            Runtime=runtime,
-            Role=self.credentials_arn,
-            Handler=handler,
-            Description=description,
-            Timeout=timeout,
-            MemorySize=memory_size,
-            VpcConfig=vpc_config,
-            Environment={"Variables": aws_environment_variables},
-            KMSKeyArn=aws_kms_key_arn,
-            TracingConfig={"Mode": "Active" if self.xray_tracing else "PassThrough"},
-            Layers=layers,
-        )
+        kwargs = {
+            "FunctionName": function_name,
+            "Role": self.credentials_arn,
+            "Description": description,
+            "Timeout": timeout,
+            "MemorySize": memory_size,
+            "VpcConfig": vpc_config,
+            "Environment": {"Variables": aws_environment_variables},
+            "KMSKeyArn": aws_kms_key_arn,
+            "TracingConfig": {"Mode": "Active" if self.xray_tracing else "PassThrough"},
+        }
+
+        if lambda_aws_config["PackageType"] != "Image":
+            kwargs.update(
+                {
+                    "Handler": handler,
+                    "Runtime": runtime,
+                    "Layers": layers,
+                }
+            )
+
+        response = self.lambda_client.update_function_configuration(**kwargs)
 
         resource_arn = response["FunctionArn"]
 
@@ -1424,12 +1447,20 @@ class Zappa:
     ):
         """
         Rollback the lambda function code 'versions_back' number of revisions.
-
         Returns the Function ARN.
         """
         response = self.lambda_client.list_versions_by_function(
             FunctionName=function_name
         )
+
+        # https://github.com/Miserlou/Zappa/pull/2192
+        if (
+            len(response.get("Versions", [])) > 1
+            and response["Versions"][-1]["PackageType"] == "Image"
+        ):
+            raise NotImplementedError(
+                "Zappa's rollback functionality is not available for Docker based deployments"
+            )
 
         # Take into account $LATEST
         if len(response["Versions"]) < versions_back + 1:
@@ -1464,10 +1495,27 @@ class Zappa:
 
         return response["FunctionArn"]
 
+    def wait_until_lambda_function_is_active(self, function_name):
+        """
+        Wait until lambda State=Active
+        """
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#waiters
+        waiter = self.lambda_client.get_waiter("function_active")
+        print(f"Waiting for lambda function [{function_name}] to become active...")
+        waiter.wait(FunctionName=function_name)
+
+    def wait_until_lambda_function_is_updated(self, function_name):
+        """
+        Wait until lambda LastUpdateStatus=Successful
+        """
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#waiters
+        waiter = self.lambda_client.get_waiter("function_updated")
+        print(f"Waiting for lambda function [{function_name}] to be updated...")
+        waiter.wait(FunctionName=function_name)
+
     def get_lambda_function(self, function_name):
         """
         Returns the lambda function ARN, given a name
-
         This requires the "lambda:GetFunction" role.
         """
         response = self.lambda_client.get_function(FunctionName=function_name)
@@ -1476,7 +1524,6 @@ class Zappa:
     def get_lambda_function_versions(self, function_name):
         """
         Simply returns the versions available for a Lambda function, given a function name.
-
         """
         try:
             response = self.lambda_client.list_versions_by_function(
@@ -1489,9 +1536,7 @@ class Zappa:
     def delete_lambda_function(self, function_name):
         """
         Given a function name, delete it from AWS Lambda.
-
         Returns the response.
-
         """
         print("Deleting Lambda function..")
 
@@ -1750,7 +1795,6 @@ class Zappa:
     ):
         """
         Create the API Gateway for this Zappa deployment.
-
         Returns the new RestAPI CF resource.
         """
 
@@ -1999,7 +2043,6 @@ class Zappa:
     ):
         """
         Deploy the API Gateway!
-
         Return the deployed API URL.
         """
         print("Deploying API Gateway..")
@@ -2372,7 +2415,7 @@ class Zappa:
 
         # build a fresh template
         self.cf_template = troposphere.Template()
-        self.cf_template.add_description("Automatically generated with Zappa")
+        self.cf_template.set_description("Automatically generated with Zappa")
         self.cf_api_resources = []
         self.cf_parameters = {}
 
@@ -2666,13 +2709,10 @@ class Zappa:
         """
         This updates your certificate information for an existing domain,
         with similar arguments to boto's update_domain_name API Gateway api.
-
         It returns the resulting new domain information including the new certificate's ARN
         if created during this process.
-
         Previously, this method involved downtime that could take up to 40 minutes
         because the API Gateway api only allowed this by deleting, and then creating it.
-
         Related issues:     https://github.com/Miserlou/Zappa/issues/590
                             https://github.com/Miserlou/Zappa/issues/588
                             https://github.com/Miserlou/Zappa/pull/458
@@ -2771,9 +2811,7 @@ class Zappa:
     def get_domain_name(self, domain_name, route53=True):
         """
         Scan our hosted zones for the record of a given name.
-
         Returns the record entry, else None.
-
         """
         # Make sure api gateway domain is present
         try:
@@ -2823,7 +2861,6 @@ class Zappa:
     def get_credentials_arn(self):
         """
         Given our role name, get and set the credentials_arn.
-
         """
         role = self.iam.Role(self.role_name)
         self.credentials_arn = role.arn
@@ -2832,7 +2869,6 @@ class Zappa:
     def create_iam_roles(self):
         """
         Create and defines the IAM roles and policies necessary for Zappa.
-
         If the IAM role already exists, it will be updated if necessary.
         """
         attach_policy_obj = json.loads(self.attach_policy)
@@ -2924,7 +2960,6 @@ class Zappa:
     def create_event_permission(self, lambda_name, principal, source_arn):
         """
         Create permissions to link to an event.
-
         Related: http://docs.aws.amazon.com/lambda/latest/dg/with-s3-example-configure-event-source.html
         """
         logger.debug(
@@ -2949,10 +2984,8 @@ class Zappa:
     def schedule_events(self, lambda_arn, lambda_name, events, default=True):
         """
         Given a Lambda ARN, name and a list of events, schedule this as CloudWatch Events.
-
         'events' is a list of dictionaries, where the dict must contains the string
         of a 'function' and the string of the event 'expression', and an optional 'name' and 'description'.
-
         Expressions can be in rate or cron format:
             http://docs.aws.amazon.com/lambda/latest/dg/tutorial-scheduled-events-schedule-expressions.html
         """
@@ -3147,7 +3180,6 @@ class Zappa:
     def get_event_name(lambda_name, name):
         """
         Returns an AWS-valid Lambda event name.
-
         """
         return "{prefix:.{width}}-{postfix}".format(
             prefix=lambda_name, width=max(0, 63 - len(name)), postfix=name
@@ -3168,10 +3200,8 @@ class Zappa:
     def delete_rule(self, rule_name):
         """
         Delete a CWE rule.
-
         This  deletes them, but they will still show up in the AWS console.
         Annoying.
-
         """
         logger.debug("Deleting existing rule {}".format(rule_name))
 
@@ -3227,7 +3257,6 @@ class Zappa:
         excluded_source_services = excluded_source_services or []
         """
         Given a list of events, unschedule these CloudWatch Events.
-
         'events' is a list of dictionaries, where the dict must contains the string
         of a 'function' and the string of the event 'expression', and an optional 'name' and 'description'.
         """
@@ -3430,7 +3459,6 @@ class Zappa:
     def get_hosted_zone_id_for_domain(self, domain):
         """
         Get the Hosted Zone ID for a given domain.
-
         """
         all_zones = self.get_all_zones()
         return self.get_best_match_zone(all_zones, domain)
@@ -3492,7 +3520,6 @@ class Zappa:
         """
         Given action, domain and challenge, return a change batch to use with
         route53 call.
-
         :param action: DELETE | UPSERT
         :param domain: domain name
         :param txt_challenge: challenge
@@ -3527,9 +3554,7 @@ class Zappa:
     def load_credentials(self, boto_session=None, profile_name=None):
         """
         Load AWS credentials.
-
         An optional boto_session can be provided, but that's usually for testing.
-
         An optional profile_name can be provided for config files that have multiple sets
         of credentials.
         """

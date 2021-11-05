@@ -25,7 +25,7 @@ setup(
     description='Server-less Python Web Services for AWS Lambda and API Gateway',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/Miserlou/Zappa',
+    url='https://github.com/zappa/Zappa',
     author='Rich Jones',
     author_email='rich@openwatch.net',
     entry_points={
@@ -42,6 +42,7 @@ setup(
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
         'Framework :: Django',
         'Framework :: Django :: 1.11',
         'Framework :: Django :: 2.0',
