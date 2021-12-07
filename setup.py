@@ -1,6 +1,5 @@
-from configparser import ConfigParser
+import os
 from io import open
-from pathlib import Path
 
 from setuptools import setup
 
@@ -9,16 +8,11 @@ from zappa import __version__
 with open("README.md", encoding="utf-8") as readme_file:
     long_description = readme_file.read()
 
-pipfile = ConfigParser()
-pipfile.read(Path(__file__).parent.resolve() / "Pipfile")
-required = [
-    "{}{}".format(name, version.strip('"')) if version != '"*"' else name
-    for name, version in pipfile["packages"].items()
-]
-test_required = [
-    "{}{}".format(name, version.strip('"')) if version != '"*"' else name
-    for name, version in pipfile["dev-packages"].items()
-]
+with open(os.path.join(os.path.dirname(__file__), "requirements.in")) as f:
+    required = f.read().splitlines()
+
+with open(os.path.join(os.path.dirname(__file__), "test_requirements.in")) as f:
+    test_required = f.read().splitlines()
 
 setup(
     name="zappa",
